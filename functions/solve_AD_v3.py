@@ -1,46 +1,26 @@
-import os
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.sparse as sp
 from scipy.sparse.linalg import splu
 from scipy.sparse.linalg import eigsh
-from scipy.sparse import csc_matrix
-
-# RL imports
-import torch
-from functions.env_fgmres import FMGRESEnv
-from functions.fgmres import FlexibleGMRES_RL
-from functions.model import DQN        # DQN architecture used in training (discrete actions)
 
 from functions.read_data_advection import read_data
-
-
-def get_solver_solution(solver):
-    """Try common ways to obtain the final solution from FlexibleGMRES_RL."""
-    if hasattr(solver, "get_solution"):
-        return solver.get_solution()
-    if hasattr(solver, "x"):
-        return solver.x
-    if hasattr(solver, "current_solution"):
-        return solver.current_solution()
-    # unknown interface
-    return None
-
 
 def solve_advection_diffusion(config):
     """
     Solve du/dt = L(t) u,  L(t) = -c(t)*A_c + mu*A_d
     with the trapezoidal rule:
       (I - dt/2 L^{n+1}) u^{n+1} = (I + dt/2 L^n) u^n
-
-    Optional RL integration: set config['use_rl']=True and provide
-    config['policy_checkpoint']='path/to/policy_net_weights.pth'.
     """
 
     # read input matrices/vectors
     data, _ = read_data(config['train_data_path'])
+    # A_c = data['Advection']['A_c']
+    # A_d = data['Diffusion']['A_d']
+    # K = data['Advection']['K']
+    # M = data['Advection']['M']
 
-    # read stored matrices (keep original formats)
+    # read stored matrices
     K = data['Advection']['K']           # advection matrix K (sparse)
     M = data['Advection']['M']           # mass matrix M (sparse)
     S = data['Diffusion']['A_d']         # diffusion / stiffness matrix (called A_d or S)
@@ -48,11 +28,17 @@ def solve_advection_diffusion(config):
     A_c, A_d = apply_M_inverse(S, M, K)
 
     # numerical params
+    # dt = float(config.get('dt', 1e-7))
+    # tf = float(config.get('tf', 1e-6))
+    # mu = float(config.get('mu', 0.1))
+    # # c = config.get('c', (lambda t: 1.0 + 0.5 * np.sin(2 * np.pi * t)))  # time-dependent default
+    # c = config.get('c', 0.1)  # time-dependent default
+
     dt = float(config.get('dt', 1e-7))
     tf = float(config.get('tf', 1e-6))
     mu = float(config.get('mu', 0.1))
-    c = config.get('c', (lambda t: 1.0 + 0.5 * np.sin(2 * np.pi * t)))  # time-dependent default
-
+    # c = config.get('c', (lambda t: 1.0 + 0.5 * np.sin(2 * np.pi * t)))  # time-dependent default
+    c = config.get('c', 0.1)  # time-dependent default
     save_every = int(config.get('save_every', 1))
     u0_type = config.get('u0_type', None)
     u0 = None
@@ -67,19 +53,23 @@ def solve_advection_diffusion(config):
         u0 = np.ravel(u0).astype(float)
 
     # Use analytic initial condition u_0(x,y)=sin(pi x) sin(pi y) when n is a perfect square.
+    # We place nodes at cell centers (x_i = (i+0.5)/m) on [0,1]^2.
     m = int(np.round(np.sqrt(n)))
     if m * m == n:
         xs = (np.arange(m) + 0.5) / m
         ys = (np.arange(m) + 0.5) / m
         X, Y = np.meshgrid(xs, ys)
+        # given f_func(x,y,t)
+        # f_n = f_func(X.ravel(), Y.ravel(), t_n)      # length-n array
+        # f_np1 = f_func(X.ravel(), Y.ravel(), t_np1)
         u = np.sin(np.pi * X.ravel()) * np.sin(np.pi * Y.ravel())
         u0 = u.astype(float)
-        u0_analytic = u.copy()
+        u0_analytic = u.copy() 
         print(f"Using analytic u0 on {m}x{m} grid for n={n}")
     else:
         print(f"n={n} is not a perfect square; keeping original u0 (or zeros)")
 
-    # print parameters and matrix information
+    # --- print parameters and matrix information ---
     print("\n===== Simulation Parameters =====")
     print(f"dt = {dt}")
     print(f"tf = {tf}")
@@ -88,39 +78,19 @@ def solve_advection_diffusion(config):
     print(f"c  = {c}")
     print(f"u0 shape = {u0.shape}")
     print(f"A_c shape = {A_c.shape}, nnz = {A_c.nnz if hasattr(A_c,'nnz') else 'N/A'}")
-    print(f"A_d shape = {A_d.shape if A_d is not None else 'None'}",
-          f", nnz = {A_d.nnz if (A_d is not None and hasattr(A_d,'nnz')) else 'N/A'}")
+    print(f"A_d shape = {A_d.shape if A_d is not None else 'None'}", 
+        f", nnz = {A_d.nnz if (A_d is not None and hasattr(A_d,'nnz')) else 'N/A'}")
     print("=================================\n")
 
-    # RL runtime config
-    use_rl = bool(config.get('use_rl', False))
-    policy_checkpoint = config.get('policy_checkpoint', None)
-    device = torch.device(config.get('device', 'cpu'))
-    rl_max_iter = int(config.get('max_iter', 200))
-    rl_tol = float(config.get('target_tol', 1e-8))
-    # number of discrete actions (must match training)
-    n_actions = int(config.get('n_actions', 11))
-
     def trapezoidal_method(mu, dt, tf, c, u, save_every=1):
+    
         I = sp.identity(n, format='csc')
 
-        # helper to build L from scalar c_val (operator-form used by code)
+        # helper to build L from scalar c_val
         def build_L(c_val):
             A_diff = A_d if A_d is not None else sp.csc_matrix((n, n))
             return (float(c_val) * A_c - mu * A_diff).tocsc()
-
-        # prepare RL objects if requested (do once per trapezoidal run)
-        if use_rl:
-            env = FMGRESEnv(config=config)
-            # observation dimension from env (fallback to 5)
-            obs_dim = getattr(env, "observation_size", 5)
-            policy_net = DQN(obs_dim, n_actions).to(device)
-            if policy_checkpoint is not None and os.path.exists(policy_checkpoint):
-                policy_net.load_state_dict(torch.load(policy_checkpoint, map_location=device))
-            policy_net.eval()
-        else:
-            env = None
-            policy_net = None
+            # return (-float(c_val) * A_c + mu * A_diff).tocsc()
 
         # time stepping setup
         nt = int(np.ceil(tf / dt))
@@ -128,81 +98,20 @@ def solve_advection_diffusion(config):
         snapshots = []
         c_is_callable = callable(c)
 
-        # local helper: run RL-controlled FGMRES for one linear system (A x = b)
-        def rl_solve(A_matrix_csc, rhs_vec):
-            """
-            A_matrix_csc: left matrix (scipy csc_matrix)
-            rhs_vec: numpy array or 1D vector
-            returns: solution vector (1D numpy)
-            """
-            try:
-                solver = FlexibleGMRES_RL(A_matrix_csc, max_iter=rl_max_iter, tol=rl_tol)
-                # initialize solver with RHS (training code did solver.initialize(b))
-                solver.initialize(rhs_vec)
-
-                # reset environment and get initial state
-                state, info = env.reset()
-                state_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-
-                done = False
-                # perform iterations; env.step(action, A, solver) applies action and advances one iteration
-                for it in range(rl_max_iter):
-                    with torch.no_grad():
-                        action = policy_net(state_t).max(1).indices.item()  # greedy action
-                    # env.step interface used in training: observation, omega_list, reward, done, residual_list, time_list = env.step(action, A, solver)
-                    observation, omega_list, reward, done, residual_list, time_list = env.step(action, A_matrix_csc, solver)
-                    next_state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
-                    state_t = next_state
-                    if done:
-                        break
-
-                # extract solution from solver (try multiple attribute names)
-                x_sol = get_solver_solution(solver)
-                if x_sol is None:
-                    # fallback if cannot retrieve: try solver to produce numpy array via attribute
-                    raise RuntimeError("RL solver did not return solution (unexpected interface).")
-                # ensure numpy array
-                if isinstance(x_sol, np.ndarray):
-                    return x_sol
-                else:
-                    return np.asarray(x_sol)
-            except Exception as e:
-                # on any error fallback to direct LU solve outside
-                print("RL solver failed, falling back to LU. Exception:", e)
-                return None
-
-        # ---------- time stepping ----------
         if not c_is_callable:
             c0 = float(c)
             L_const = build_L(c0)
             left_const = (I - 0.5 * dt * L_const).tocsc()
             right_const = (I + 0.5 * dt * L_const).tocsc()
-
-            # Pre-factor LU for fallback (and to use if RL is disabled)
-            LU_const = None
-            if not use_rl:
-                LU_const = splu(left_const)
-
+            LU_const = splu(left_const)
             for k, t in enumerate(times[:-1]):
                 rhs = right_const.dot(u)
-
-                if use_rl:
-                    # RL attempt
-                    u_new = rl_solve(left_const, np.asarray(rhs).ravel())
-                    if u_new is None:
-                        # fallback to LU
-                        if LU_const is None:
-                            LU_const = splu(left_const)
-                        u = LU_const.solve(rhs)
-                    else:
-                        u = u_new
-                else:
-                    # original direct solve
-                    u = LU_const.solve(rhs)
-
+                u = LU_const.solve(rhs)
+                # evaluate source vectors f_n, f_np1 as length-n numpy arrays
+                # rhs = right.dot(u) + 0.5*dt*(f_n + f_np1)
+                # u = LU.solve(rhs)
                 if k % save_every == 0:
                     snapshots.append(u.copy())
-
         else:
             for k, t in enumerate(times[:-1]):
                 t_n = t
@@ -213,49 +122,59 @@ def solve_advection_diffusion(config):
                 L_np1 = build_L(c_np1)
                 left = (I - 0.5 * dt * L_np1).tocsc()
                 right = (I + 0.5 * dt * L_n).tocsc()
-
+                LU = splu(left)
                 rhs = right.dot(u)
-
-                if use_rl:
-                    u_new = rl_solve(left, np.asarray(rhs).ravel())
-                    if u_new is None:
-                        # fallback: LU solve
-                        LU = splu(left)
-                        u = LU.solve(rhs)
-                    else:
-                        u = u_new
-                else:
-                    LU = splu(left)
-                    u = LU.solve(rhs)
-
+                u = LU.solve(rhs)
+                # evaluate source vectors f_n, f_np1 as length-n numpy arrays
+                # rhs = right.dot(u) + 0.5*dt*(f_n + f_np1)
+                # u = LU.solve(rhs)
                 if k % save_every == 0:
                     snapshots.append(u.copy())
 
         snapshots.append(u.copy())
+
         return {'times': times, 'solutions': snapshots, 'u_final': u}
 
-    # Run tests / experiments
-    if config.get('pure_advection_test', 0) == 1:
+    
+    if config['pure_advection_test']==1:
+
         print('Running pure advection problem ......')
-        result = trapezoidal_method(mu=0.0, dt=dt, tf=tf, c=c, u=u, save_every=save_every)
-        u_ref = np.sin(np.pi * (X - (config.get('c',1.0)) * tf)) * np.sin(np.pi * Y)
+        result = trapezoidal_method(mu=0.0, dt=dt, tf=tf, c=c, u=u, 
+                                save_every=save_every)
+        u_ref = np.sin(np.pi * (X - c * tf)) * np.sin(np.pi * Y)
         u_ref = u_ref.ravel()
         u = result['u_final']
         solution_accuracy_test(u_ref, u, n)
 
-    elif config.get('pure_diffusion_test', 0) == 1:
+    elif config['pure_diffusion_test']==1:
+
         print('Running pure diffusion problem ......')
-        result = trapezoidal_method(mu=mu, dt=dt, tf=tf, c=0.0, u=u, save_every=save_every)
-        # use discrete eigenvalue for reference if desired (not shown here)
-        factor = np.exp(-2.0 * np.pi**2 * mu * result['times'][-1])
+        result = trapezoidal_method(mu=mu, dt=dt, tf=tf, c=0.0, u=u, 
+                                save_every=save_every)
+        factor = np.exp(-2.0 * np.pi**2 * mu * result['times'][-1])       # analytic decay factor
         u_ref = factor * u0_analytic
         u = result['u_final']
         solution_accuracy_test(u_ref, u, n)
-
+    
     else:
         print('Running advection diffusion problem ......')
-        result = trapezoidal_method(mu=mu, dt=dt, tf=tf, c=c, u=u, save_every=save_every)
+        
+        # # K = stiffness matrix, M = mass matrix (scipy sparse)
+        # k = 1  # compute first nontrivial eigenpair
+        # vals, vecs = eigsh(K, k=k, M=M, which='SM')   # 'SM' = smallest magnitude
+        # lambda1 = float(vals[0])
+        # phi = vecs[:,0]
+        # # mass-normalize phi so phi^T M phi = 1
+        # norm2 = (phi @ (M.dot(phi)))**0.5
+        # phi = phi / norm2
+        # # analytic factor at time t
+        # factor = np.exp(-mu * lambda1 * tf)
+        # u_ref = factor * phi
+
+        result = trapezoidal_method(mu=mu, dt=dt, tf=tf, c=c, u=u, 
+                                save_every=save_every)
         u = result['u_final']
+        # solution_accuracy_test(u_ref, u, n)
 
     # Plot final solution:
     m = int(np.round(np.sqrt(n)))
@@ -266,6 +185,7 @@ def solve_advection_diffusion(config):
         plt.colorbar(label='u')
         plt.title(f'Final solution u(T) — 2D ({m}x{m})')
     else:
+        # non-analytic / vector IC — keep 1D plot
         plt.figure()
         plt.plot(u)
         plt.title('Final solution u(T)')
@@ -275,7 +195,6 @@ def solve_advection_diffusion(config):
     plt.show()
 
     return result
-
 
 def solution_accuracy_test(u_ref, u, n):
     L2_err = np.linalg.norm(u - u_ref) / np.sqrt(n)       # discrete L2 on unit square
