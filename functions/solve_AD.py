@@ -1,3 +1,4 @@
+import math
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,26 +7,16 @@ from scipy.sparse.linalg import splu
 from scipy.sparse.linalg import eigsh
 from scipy.sparse import csc_matrix
 
+from collections import namedtuple, deque
+import random
+
 # RL imports
 import torch
+import torch.optim as optim
 from functions.env_fgmres import FMGRESEnv
-from functions.fgmres import FlexibleGMRES_RL
-from functions.model import DQN        # DQN architecture used in training (discrete actions)
-
+from functions.fgmres import FlexibleGMRES_RL, FlexibleGMRES_original
+from functions.model import DQN, optimize_model
 from functions.read_data_advection import read_data
-
-
-def get_solver_solution(solver):
-    """Try common ways to obtain the final solution from FlexibleGMRES_RL."""
-    if hasattr(solver, "get_solution"):
-        return solver.get_solution()
-    if hasattr(solver, "x"):
-        return solver.x
-    if hasattr(solver, "current_solution"):
-        return solver.current_solution()
-    # unknown interface
-    return None
-
 
 def solve_advection_diffusion(config):
     """
@@ -112,12 +103,48 @@ def solve_advection_diffusion(config):
         # prepare RL objects if requested (do once per trapezoidal run)
         if use_rl:
             env = FMGRESEnv(config=config)
-            # observation dimension from env (fallback to 5)
-            obs_dim = getattr(env, "observation_size", 5)
-            policy_net = DQN(obs_dim, n_actions).to(device)
-            if policy_checkpoint is not None and os.path.exists(policy_checkpoint):
-                policy_net.load_state_dict(torch.load(policy_checkpoint, map_location=device))
-            policy_net.eval()
+            Transition = namedtuple('Transition',
+                            ('state', 'action', 'next_state', 'reward'))
+            class ReplayMemory(object):
+                def __init__(self, capacity):
+                    self.memory = deque([], maxlen=capacity)
+                def push(self, *args):
+                    """Save a transition"""
+                    self.memory.append(Transition(*args))
+                def sample(self, batch_size):
+                    return random.sample(self.memory, batch_size)
+                def __len__(self):
+                    return len(self.memory)
+            BATCH_SIZE = config["batch_size"]
+            GAMMA = config["gamma"]
+            EPS_START = config["eps_start"]
+            EPS_END = config["eps_end"]
+            EPS_DECAY = config["eps_decay"]
+            TAU = config["tau"]
+            LR = config["learning_rate"]
+            num_episodes = config["num_episodes"]
+            n_actions = config['n_actions']
+            n_observations = 5
+            policy_net = DQN(n_observations, n_actions).to(device)
+            target_net = DQN(n_observations, n_actions).to(device)
+            target_net.load_state_dict(policy_net.state_dict())
+            optimizer = optim.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
+            memory = ReplayMemory(10000)
+            steps_done = 0
+            def select_action(state):
+                nonlocal steps_done
+                sample = random.random()
+                eps_threshold = EPS_END + (EPS_START - EPS_END) * \
+                    math.exp(-1. * steps_done / EPS_DECAY)
+                steps_done += 1
+                if sample > eps_threshold:
+                    with torch.no_grad():
+                        # t.max(1) will return the largest column value of each row.
+                        # second column on max result is index of where max element was
+                        # found, so we pick action with the larger expected reward.
+                        return policy_net(state).max(1).indices.view(1, 1)
+                else:
+                    return torch.tensor([[env.action_space.sample()]], device=device, dtype=torch.long)
         else:
             env = None
             policy_net = None
@@ -128,47 +155,47 @@ def solve_advection_diffusion(config):
         snapshots = []
         c_is_callable = callable(c)
 
+        def baseline_fgmres(A_matrix_csc, rhs_vec):
+            gmres_baseline = FlexibleGMRES_original(A_matrix_csc, max_iter=config["max_iter"], tol=config["target_tol"])
+            x_baseline, resid_baseline = gmres_baseline.solve(rhs_vec)
+            return x_baseline, resid_baseline
+
         # local helper: run RL-controlled FGMRES for one linear system (A x = b)
         def rl_solve(A_matrix_csc, rhs_vec):
-            """
-            A_matrix_csc: left matrix (scipy csc_matrix)
-            rhs_vec: numpy array or 1D vector
-            returns: solution vector (1D numpy)
-            """
             try:
                 solver = FlexibleGMRES_RL(A_matrix_csc, max_iter=rl_max_iter, tol=rl_tol)
-                # initialize solver with RHS (training code did solver.initialize(b))
                 solver.initialize(rhs_vec)
-
-                # reset environment and get initial state
                 state, info = env.reset()
-                state_t = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-
-                done = False
-                # perform iterations; env.step(action, A, solver) applies action and advances one iteration
+                state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+                x_sol = None
                 for it in range(rl_max_iter):
-                    with torch.no_grad():
-                        action = policy_net(state_t).max(1).indices.item()  # greedy action
-                    # env.step interface used in training: observation, omega_list, reward, done, residual_list, time_list = env.step(action, A, solver)
-                    observation, omega_list, reward, done, residual_list, time_list = env.step(action, A_matrix_csc, solver)
+                    # choose action using epsilon-greedy
+                    action = select_action(state)
+                    # environment step
+                    observation, x_approx, omega_list, reward, done, residual_list, time_list = env.step(action.item(), A_matrix_csc, solver)
+                    reward = torch.tensor([reward], device=device)
                     next_state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
-                    state_t = next_state
+                    # store transition
+                    memory.push(state, action, next_state, reward)
+                    # move to next state
+                    state = next_state
+                    # optimize policy network
+                    optimize_model(Transition, memory, policy_net, target_net, optimizer, device, BATCH_SIZE, GAMMA,)
+                    # soft update target network
+                    target_net_state_dict = target_net.state_dict()
+                    policy_net_state_dict = policy_net.state_dict()
+                    for key in policy_net_state_dict:
+                        target_net_state_dict[key] = (
+                            policy_net_state_dict[key] * TAU
+                            + target_net_state_dict[key] * (1 - TAU)
+                        )
+                    target_net.load_state_dict(target_net_state_dict)
+                    x_sol = x_approx
                     if done:
                         break
-
-                # extract solution from solver (try multiple attribute names)
-                x_sol = get_solver_solution(solver)
-                if x_sol is None:
-                    # fallback if cannot retrieve: try solver to produce numpy array via attribute
-                    raise RuntimeError("RL solver did not return solution (unexpected interface).")
-                # ensure numpy array
-                if isinstance(x_sol, np.ndarray):
-                    return x_sol
-                else:
-                    return np.asarray(x_sol)
+                return x_sol, residual_list
             except Exception as e:
-                # on any error fallback to direct LU solve outside
-                print("RL solver failed, falling back to LU. Exception:", e)
+                print("RL solver failed, falling back to LU:", e)
                 return None
 
         # ---------- time stepping ----------
@@ -188,7 +215,10 @@ def solve_advection_diffusion(config):
 
                 if use_rl:
                     # RL attempt
-                    u_new = rl_solve(left_const, np.asarray(rhs).ravel())
+                    rhs_vec = np.asarray(rhs).ravel()
+                    x_baseline, resid_baseline = baseline_fgmres(left_const, rhs_vec)
+                    u_new, resid_rl = rl_solve(left_const, rhs_vec)
+                    plot_fgmres_comparison(resid_baseline, resid_rl)
                     if u_new is None:
                         # fallback to LU
                         if LU_const is None:
@@ -217,7 +247,10 @@ def solve_advection_diffusion(config):
                 rhs = right.dot(u)
 
                 if use_rl:
-                    u_new = rl_solve(left, np.asarray(rhs).ravel())
+                    rhs_vec = np.asarray(rhs).ravel()
+                    x_baseline, resid_baseline = baseline_fgmres(left, rhs_vec)
+                    u_new, resid_rl = rl_solve(left, rhs_vec)
+                    plot_fgmres_comparison(resid_baseline, resid_rl)
                     if u_new is None:
                         # fallback: LU solve
                         LU = splu(left)
@@ -323,3 +356,16 @@ def apply_M_inverse(S, M, K):
     A_c = apply_minv_to(K)
     A_d = apply_minv_to(S)
     return A_c, A_d
+
+
+def plot_fgmres_comparison(res_baseline, res_rl):
+    plt.figure()
+    plt.semilogy(res_baseline, label="FGMRES (no preconditioner)", linewidth=2)
+    plt.semilogy(res_rl, label="RL-FGMRES", linewidth=2)
+    plt.xlabel("Iteration")
+    plt.ylabel("Residual norm")
+    plt.title("FGMRES Convergence Comparison")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("fgmres_comparison.png", dpi=300)
+    plt.show()

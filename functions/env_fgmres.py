@@ -33,7 +33,7 @@ class FMGRESEnv(gym.Env):
         high = np.array([ np.inf,  np.inf, np.inf, 1.0, np.inf], dtype=np.float32)
         self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32) 
 
-        self.train_loader = config["train_loader"]
+        # self.train_loader = config["train_loader"]
         self.target_tol = config["target_tol"]
         self.omega_min = config["omega_min"]
         self.omega_max = config["omega_max"]
@@ -103,7 +103,7 @@ class FMGRESEnv(gym.Env):
         self.omega_list.append(omega)
 
         M_sor_ = M_sor(A, omega=omega)
-        _, residual_vector, _ , residual_norm, _ = solver.step(M=M_sor_, omega=omega)
+        _, residual_vector, x_approx , residual_norm, _ = solver.step(M=M_sor_, omega=omega)
     
         self.residuals_list.append(residual_norm)
         convergence_rate = self.step_convergence_ratio()
@@ -130,6 +130,6 @@ class FMGRESEnv(gym.Env):
         print('@@ convergence_rate: ', convergence_rate)
         print(f'@@ reward: {reward}')
 
-        return np.array(self.state, dtype=np.float32), \
+        return np.array(self.state, dtype=np.float32), x_approx, \
             self.omega_list, reward, terminated, self.residuals_list, None
     
